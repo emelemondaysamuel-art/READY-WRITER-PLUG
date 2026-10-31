@@ -1,0 +1,283 @@
+const JSZip = require('jszip');
+const PDFDocument = require('pdfkit');
+const sharp = require('sharp');
+const crypto = require('crypto');
+
+const TRIMS = { '5x8': [5, 8], '5.5x8.5': [5.5, 8.5], '6x9': [6, 9], '8.5x11': [8.5, 11] };
+const THEMES = {
+  midnight: { bg: '#0f1226', fg: '#d4af37', sub: '#b8a15a' },
+  crimson: { bg: '#4a0d19', fg: '#f3e2c7', sub: '#d9b99b' },
+  forest: { bg: '#0d2a20', fg: '#e8d9a8', sub: '#b5c4a0' },
+  ivory: { bg: '#f6f0e0', fg: '#2a2118', sub: '#8a6d3b' }
+};
+const TNR = { r: 'Times-Roman', i: 'Times-Italic', b: 'Times-Bold' };
+const FONTS = { serif: TNR, classic: TNR, sans: { r: 'Helvetica', i: 'Helvetica-Oblique', b: 'Helvetica-Bold' } };
+const CSSFONT = {
+  serif: 'Georgia, serif',
+  classic: "'Palatino Linotype', Palatino, 'Book Antiqua', serif",
+  sans: 'Helvetica, Arial, sans-serif'
+};
+
+const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const inl = t => esc(t).replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+  .replace(/\*(.+?)\*/g, '<em>$1</em>').replace(/\n/g, '<br/>');
+
+// ---------- text processing ----------
+function edit(p) {
+  return p.replace(/\s*\n\s*/g, ' ').replace(/[ \t]{2,}/g, ' ').trim()
+    .replace(/\.{3,}|…/g, '…')
+    .replace(/\s*--+\s*|\s+[–-]\s+/g, '—')
+    .replace(/(^|[\s(\[{—])"/g, '$1“').replace(/"/g, '”')
+    .replace(/(^|[\s(\[{—“])'/g, '$1‘').replace(/'/g, '’')
+    .replace(/\b([A-Za-z’]+)(\s+\1\b)+/gi, (m, w) => /^(had|that|is|do|was)$/i.test(w) ? m : w)
+    .replace(/\s+([,.;:!?])/g, '$1');
+}
+
+function parse(text) {
+  const head = /^\s*(?:#{1,2}\s+(.+)|(chapter\s+[\w-]+\b.*|prologue|epilogue|preface|foreword|introduction|acknowledg(?:e)?ments))\s*$/i;
+  const chs = []; let cur = null;
+  for (const l of text.replace(/\r\n?/g, '\n').split('\n')) {
+    const m = l.length < 100 && l.match(head);
+    if (m) { cur = { title: (m[1] || m[2]).trim(), lines: [] }; chs.push(cur); continue; }
+    if (!cur) { if (!l.trim()) continue; cur = { title: null, lines: [] }; chs.push(cur); }
+    cur.lines.push(l);
+  }
+  return chs;
+}
+
+function blocks(lines, o) {
+  return lines.join('\n').split(/\n\s*\n/).map(s => s.trim()).filter(Boolean).map(s => {
+    if (/^(\*\s*){3,}$|^[-_]{3,}$|^#\s*#\s*#$/.test(s)) return { t: 'br' };
+    const im = s.match(/^\[image:\s*(.+?)\]$/i);
+    if (im) return { t: 'img', name: im[1] };
+    return { t: 'p', text: o.autoedit ? edit(s) : s };
+  });
+}
+
+// ---------- cover ----------
+function wrapWords(s, n) {
+  const L = []; let c = '';
+  for (const x of s.split(/\s+/)) {
+    if ((c + ' ' + x).trim().length > n && c) { L.push(c); c = x; } else c = (c + ' ' + x).trim();
+  }
+  if (c) L.push(c);
+  return L;
+}
+
+function coverSvg(w, h, o) {
+  const T = THEMES[o.cover] || THEMES.midnight;
+  const size = Math.round(w * (o.title.length > 22 ? 0.075 : 0.1));
+  const lines = wrapWords(o.title.toUpperCase(), Math.max(6, Math.floor((w * 0.78) / (size * 0.66))));
+  const y0 = h * 0.3;
+  const t = lines.map((l, i) => `<text x="${w / 2}" y="${y0 + i * size * 1.2}" font-size="${size}" font-weight="700" fill="${T.fg}" text-anchor="middle" font-family="Georgia, 'DejaVu Serif', serif" letter-spacing="${size * 0.04}">${esc(l)}</text>`).join('');
+  const yl = y0 + lines.length * size * 1.2 + size * 0.2;
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">
+<rect width="100%" height="100%" fill="${T.bg}"/>
+<rect x="${w * 0.04}" y="${w * 0.04}" width="${w * 0.92}" height="${h - w * 0.08}" fill="none" stroke="${T.fg}" stroke-width="4"/>
+<rect x="${w * 0.055}" y="${w * 0.055}" width="${w * 0.89}" height="${h - w * 0.11}" fill="none" stroke="${T.sub}" stroke-width="1.5" opacity=".6"/>
+${o.series ? `<text x="${w / 2}" y="${h * 0.12}" font-size="${w * 0.04}" fill="${T.sub}" text-anchor="middle" font-style="italic" font-family="Georgia, 'DejaVu Serif', serif">${esc(o.series)}</text>` : ''}
+${t}
+<line x1="${w * 0.3}" y1="${yl}" x2="${w * 0.7}" y2="${yl}" stroke="${T.fg}" stroke-width="3"/>
+<rect x="${w / 2 - 9}" y="${yl - 9}" width="18" height="18" fill="${T.fg}" transform="rotate(45 ${w / 2} ${yl})"/>
+<text x="${w / 2}" y="${h * 0.88}" font-size="${w * 0.05}" fill="${T.sub}" text-anchor="middle" letter-spacing="${w * 0.008}" font-family="Georgia, 'DejaVu Serif', serif">${esc(o.author.toUpperCase())}</text>
+</svg>`;
+}
+const coverJpg = (o, w, h) => sharp(Buffer.from(coverSvg(w, h, o))).jpeg({ quality: 92 }).toBuffer();
+
+// ---------- EPUB ----------
+const xh = (t, body, cls = '') => `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="en"><head><meta charset="utf-8"/><title>${esc(t)}</title><link rel="stylesheet" type="text/css" href="style.css"/></head><body class="${cls}">${body}</body></html>`;
+
+async function epub(o, chs, imgs, cover) {
+  const z = new JSZip(), id = 'urn:uuid:' + crypto.randomUUID(), yr = new Date().getFullYear();
+  z.file('mimetype', 'application/epub+zip', { compression: 'STORE' });
+  z.file('META-INF/container.xml', '<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>');
+  const O = (p, c) => z.file('OEBPS/' + p, c);
+  const items = [];
+  const page = (pid, title, body, cls, nav) => { O(pid + '.xhtml', xh(title, body, cls)); items.push({ id: pid, href: pid + '.xhtml', title, nav }); };
+
+  page('cover', 'Cover', '<div class="cover"><img src="cover.jpg" alt="Cover"/></div>', 'nm');
+  page('title', 'Title Page', `<div class="tp"><h1>${esc(o.title)}</h1>${o.series ? `<p class="ser">${esc(o.series)}</p>` : ''}<p class="au">${esc(o.author)}</p></div>`);
+  if (o.copyright) page('copy', 'Copyright', `<div class="cp"><p>Copyright © ${yr} ${esc(o.author)}</p><p>All rights reserved. No part of this book may be reproduced in any form without written permission from the author, except for brief quotations in reviews.</p>${o.isbn ? `<p>ISBN: ${esc(o.isbn)}</p>` : ''}</div>`);
+  if (o.dedication) page('ded', 'Dedication', `<div class="ded"><p><em>${esc(o.dedication)}</em></p></div>`);
+  if (o.contents) page('toc', 'Contents', `<h1>Contents</h1><ol class="toc">${chs.map((c, i) => `<li><a href="ch${i + 1}.xhtml">${esc(c.title)}</a></li>`).join('')}</ol>`);
+
+  chs.forEach((c, i) => {
+    let first = true;
+    const body = c.blocks.map(b => {
+      if (b.t === 'br') { first = true; return '<p class="br">* * *</p>'; }
+      if (b.t === 'img') { const im = imgs[b.name]; return im ? `<div class="img"><img src="images/${im.file}" alt=""/></div>` : ''; }
+      const h = `<p${first ? ' class="f"' : ''}>${inl(b.text)}</p>`; first = false; return h;
+    }).join('\n');
+    page('ch' + (i + 1), c.title, `<h1>${esc(c.title)}</h1>\n${body}`, '', true);
+  });
+  if (o.about) page('about', 'About the Author', `<h1>About the Author</h1>${o.about.split(/\n\s*\n/).map(p => `<p class="f">${inl(p)}</p>`).join('')}`, '', true);
+  if (o.alsoList.length) page('also', `Also by ${o.author}`, `<h1>Also by ${esc(o.author)}</h1><ul class="also">${o.alsoList.map(t => `<li>${esc(t)}</li>`).join('')}</ul>`, '', true);
+
+  const navItems = items.filter(i => i.nav);
+  O('nav.xhtml', xh('Contents', `<nav epub:type="toc" id="toc"><h1>Contents</h1><ol>${navItems.map(i => `<li><a href="${i.href}">${esc(i.title)}</a></li>`).join('')}</ol></nav>`));
+  O('toc.ncx', `<?xml version="1.0" encoding="UTF-8"?><ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1"><head><meta name="dtb:uid" content="${id}"/></head><docTitle><text>${esc(o.title)}</text></docTitle><navMap>${navItems.map((i, k) => `<navPoint id="n${k}" playOrder="${k + 1}"><navLabel><text>${esc(i.title)}</text></navLabel><content src="${i.href}"/></navPoint>`).join('')}</navMap></ncx>`);
+  O('style.css', `body{font-family:${CSSFONT[o.font] || CSSFONT.serif};line-height:1.5;margin:0}
+h1{text-align:center;font-size:1.6em;margin:3em 0 1.5em;page-break-before:always;${o.font === 'classic' ? 'text-transform:uppercase;letter-spacing:.1em;' : ''}}
+p{margin:0;text-indent:1.4em;text-align:justify}p.f,p.br{text-indent:0}p.br{text-align:center;margin:1.5em 0}
+.nm,.cover{margin:0;text-align:center}.cover img{max-width:100%;max-height:100%}
+.tp{text-align:center;margin-top:30%}.tp h1{margin:0 0 .5em;page-break-before:avoid}.ser{text-indent:0;font-style:italic;text-align:center}.au{text-indent:0;text-align:center;font-size:1.2em;margin-top:3em}
+.cp p,.ded p{text-indent:0;text-align:center;font-size:.85em;margin:.8em 0}.ded{margin-top:35%}.ded p{font-size:1.1em}
+.toc{list-style:none;padding:0}.toc li{margin:.5em 0}.toc a,nav a{text-decoration:none;color:inherit}.also{list-style:none;padding:0;text-align:center}.img{text-align:center;margin:1em 0}.img img{max-width:100%}`);
+  O('cover.jpg', cover);
+  Object.values(imgs).forEach(m => O('images/' + m.file, m.buf));
+
+  const man = items.map(i => `<item id="${i.id}" href="${i.href}" media-type="application/xhtml+xml"/>`).join('')
+    + Object.values(imgs).map((m, k) => `<item id="im${k}" href="images/${m.file}" media-type="${m.mime}"/>`).join('')
+    + '<item id="css" href="style.css" media-type="text/css"/><item id="cover-image" href="cover.jpg" media-type="image/jpeg" properties="cover-image"/><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/><item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>';
+  O('content.opf', `<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid" xml:lang="en"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="bookid">${id}</dc:identifier><dc:title>${esc(o.title)}</dc:title><dc:creator>${esc(o.author)}</dc:creator><dc:language>en</dc:language><meta property="dcterms:modified">${new Date().toISOString().replace(/\.\d+Z$/, 'Z')}</meta><meta name="cover" content="cover-image"/></metadata><manifest>${man}</manifest><spine toc="ncx">${items.map(i => `<itemref idref="${i.id}"/>`).join('')}</spine></package>`);
+  return z.generateAsync({ type: 'nodebuffer', mimeType: 'application/epub+zip', compression: 'DEFLATE' });
+}
+
+// ---------- PDF ----------
+function rich(doc, text, F, opts) {
+  const parts = text.split(/(\*\*[^*]+\*\*|\*[^*]+\*)/).filter(Boolean);
+  parts.forEach((s, i) => {
+    let f = F.r;
+    if (s.startsWith('**') && s.length > 4) { f = F.b; s = s.slice(2, -2); }
+    else if (s.startsWith('*') && s.length > 2) { f = F.i; s = s.slice(1, -1); }
+    doc.font(f).text(s, { ...opts, continued: i < parts.length - 1 });
+  });
+}
+
+function gutterFor(pages) { return pages <= 150 ? 0.375 : pages <= 300 ? 0.5 : pages <= 500 ? 0.625 : pages <= 700 ? 0.75 : 0.875; }
+
+function pdf(o, chs, imgs, frontCover, gutter) {
+  return new Promise(resolve => {
+    const [w, h] = o.dims.map(x => x * 72), F = FONTS[o.font] || TNR;
+    const doc = new PDFDocument({ size: [w, h], autoFirstPage: false, bufferPages: true, info: { Title: o.title, Author: o.author } });
+    const bufs = []; let count = 0, body = false, skip = false; const numbered = new Set();
+    doc.on('data', b => bufs.push(b));
+    doc.on('end', () => resolve({ buf: Buffer.concat(bufs), pages: count }));
+    doc.on('pageAdded', () => {
+      count++;
+      const odd = count % 2 === 1;
+      const inside = o.print ? gutter * 72 : 54, outside = o.print ? 36 : 54;
+      const left = odd ? inside : outside, right = odd ? outside : inside;
+      doc.page.margins = { top: 54, bottom: 60, left, right };
+      doc.x = left; doc.y = 54;
+      if (body && !skip) numbered.add(count);
+      skip = false;
+    });
+    const tw = () => doc.page.width - doc.page.margins.left - doc.page.margins.right;
+    const center = (t, f, size, gap = 0.5) => { doc.font(f).fontSize(size).text(t, { align: 'center' }); doc.moveDown(gap); };
+
+    if (!o.print) { doc.addPage(); doc.image(frontCover, 0, 0, { width: w, height: h }); }
+    doc.addPage(); doc.y = h * 0.28; center(o.title, F.b, 28, 0.6);
+    if (o.series) center(o.series, F.i, 12);
+    doc.y = h * 0.7; center(o.author, F.r, 16);
+    if (o.copyright) {
+      doc.addPage(); doc.y = h * 0.6;
+      center(`Copyright © ${new Date().getFullYear()} ${o.author}`, F.r, 9);
+      center('All rights reserved. No part of this book may be reproduced in any form without written permission from the author, except for brief quotations in reviews.', F.r, 9);
+      if (o.isbn) center('ISBN: ' + o.isbn, F.r, 9);
+    }
+    if (o.dedication) { doc.addPage(); doc.y = h * 0.35; center(o.dedication, F.i, 13); }
+    if (o.contents) {
+      doc.addPage(); center('Contents', F.b, 20, 1.5);
+      chs.forEach(c => { doc.font(F.r).fontSize(11).text(c.title); doc.moveDown(0.4); });
+    }
+    chs.forEach(c => {
+      skip = true; body = true; doc.addPage(); doc.y = h * 0.12;
+      doc.font(F.b).fontSize(20).text(o.font === 'classic' ? c.title.toUpperCase() : c.title, { align: 'center', characterSpacing: o.font === 'classic' ? 2 : 0 });
+      doc.moveDown(2); let first = true;
+      c.blocks.forEach(b => {
+        if (b.t === 'br') { doc.moveDown(0.6); center('*   *   *', F.r, 11, 0.6); first = true; return; }
+        if (b.t === 'img') {
+          const im = imgs[b.name]; if (!im) return;
+          try {
+            if (doc.y + h * 0.5 > h - doc.page.margins.bottom - 10) doc.addPage();
+            doc.image(im.buf, { fit: [tw(), h * 0.5], align: 'center' }); doc.moveDown(0.5);
+          } catch (e) { /* unsupported image type for PDF */ }
+          return;
+        }
+        doc.fontSize(11.5);
+        rich(doc, b.text, F, { align: 'justify', indent: first ? 0 : 18, lineGap: 2 });
+        first = false;
+      });
+    });
+    body = false;
+    if (o.about) { doc.addPage(); center('About the Author', F.b, 16, 1); doc.font(F.r).fontSize(11).text(o.about.replace(/\*+/g, ''), { align: 'left' }); }
+    if (o.alsoList.length) { doc.addPage(); center('Also by ' + o.author, F.b, 16, 1); o.alsoList.forEach(t => center(t, F.i, 12)); }
+
+    const off = o.print ? 0 : 1;
+    for (let i = 0; i < count; i++) {
+      if (!numbered.has(i + 1)) continue;
+      doc.switchToPage(i);
+      const bm = doc.page.margins.bottom; doc.page.margins.bottom = 0;
+      doc.font(F.r).fontSize(9).text(String(i + 1 - off), doc.page.margins.left, h - 40, { width: tw(), align: 'center', lineBreak: false });
+      doc.page.margins.bottom = bm;
+    }
+    doc.end();
+  });
+}
+
+function wrapPdf(o, pages, front) {
+  return new Promise(resolve => {
+    const T = THEMES[o.cover] || THEMES.midnight, [tw, th] = o.dims, bl = 0.125;
+    const even = pages + (pages % 2), sp = even * 0.002252; // KDP white paper
+    const W = (2 * tw + sp + 2 * bl) * 72, H = (th + 2 * bl) * 72;
+    const doc = new PDFDocument({ size: [W, H], margin: 0 }), bufs = [];
+    doc.on('data', b => bufs.push(b)); doc.on('end', () => resolve(Buffer.concat(bufs)));
+    doc.rect(0, 0, W, H).fill(T.bg);
+    doc.image(front, (bl + tw + sp) * 72, bl * 72, { width: tw * 72, height: th * 72 });
+    if (o.blurb) doc.fillColor(T.fg).font('Times-Roman').fontSize(11).text(o.blurb, (bl + 0.6) * 72, (bl + 0.8) * 72, { width: (tw - 1.2) * 72, align: 'left', lineGap: 3 });
+    doc.rect((bl + tw - 0.5 - 2) * 72, (bl + th - 0.5 - 1.2) * 72, 2 * 72, 1.2 * 72).fill('#ffffff');
+    if (even >= 79) {
+      doc.save(); doc.translate((bl + tw + sp / 2) * 72, (bl + 0.5) * 72); doc.rotate(90);
+      doc.fillColor(T.fg).font('Times-Bold').fontSize(Math.min(14, sp * 72 * 0.6))
+        .text(`${o.title}   ·   ${o.author}`, 0, -Math.min(14, sp * 72 * 0.6) / 2, { width: (th - 1) * 72, align: 'center', lineBreak: false });
+      doc.restore();
+    }
+    doc.end();
+  });
+}
+
+// ---------- main ----------
+async function build(o) {
+  o.title = (o.title || '').trim() || 'Untitled';
+  o.author = (o.author || '').trim() || 'Anonymous';
+  o.dims = TRIMS[o.trim] || TRIMS['5.5x8.5'];
+  o.alsoList = (o.alsoby || '').split(',').map(s => s.trim()).filter(Boolean);
+  o.about = (o.about || '').trim(); o.blurb = (o.blurb || '').trim();
+  o.dedication = (o.dedication || '').trim(); o.series = (o.series || '').trim();
+
+  const chs = parse(o.text || '').map((c, i) => ({ title: c.title || 'Chapter ' + (i + 1), blocks: blocks(c.lines, o) }));
+  if (!chs.length) throw new Error('Paste or upload some chapters first.');
+
+  const imgs = {}; let n = 0;
+  if (o.style === 'pictures') {
+    for (const [k, v] of Object.entries(o.images || {})) {
+      const m = /^data:(image\/(png|jpe?g|gif|webp));base64,(.+)$/.exec(v);
+      if (!m) continue;
+      const ext = m[2].replace('jpeg', 'jpg');
+      imgs[k] = { buf: Buffer.from(m[3], 'base64'), mime: ext === 'jpg' ? 'image/jpeg' : m[1], file: `img${++n}.${ext}` };
+    }
+  }
+
+  const ebookCover = await coverJpg(o, 1600, 2560);
+  const frontCover = await coverJpg(o, Math.round(o.dims[0] * 200), Math.round(o.dims[1] * 200));
+  const epubBuf = await epub(o, chs, imgs, ebookCover);
+
+  let r = await pdf(o, chs, imgs, frontCover, 0.5);
+  if (o.print) r = await pdf(o, chs, imgs, frontCover, gutterFor(r.pages));
+  const wrap = await wrapPdf(o, r.pages, frontCover);
+
+  const slug = o.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40) || 'book';
+  const zip = new JSZip();
+  zip.file(`${slug}.epub`, epubBuf);
+  zip.file(`${slug}-interior.pdf`, r.buf);
+  zip.file(`${slug}-ebook-cover.jpg`, ebookCover);
+  zip.file(`${slug}-print-cover-wrap.pdf`, wrap);
+  const words = chs.reduce((a, c) => a + c.blocks.reduce((b, k) => b + (k.text ? k.text.split(/\s+/).length : 0), 0), 0);
+  return { slug, zip: await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' }), stats: { chapters: chs.length, words, pages: r.pages } };
+}
+
+module.exports = { build };
