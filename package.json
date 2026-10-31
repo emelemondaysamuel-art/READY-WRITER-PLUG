@@ -1,0 +1,16 @@
+{
+  "name": "ready-writer",
+  "version": "1.0.0",
+  "description": "Paste or upload a manuscript, get a KDP-ready EPUB, PDF and covers",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "express": "^4.19.2",
+    "jszip": "^3.10.1",
+    "mammoth": "^1.8.0",
+    "multer": "^1.4.5-lts.1",
+    "pdfkit": "^0.15.0",
+    "sharp": "^0.33.5"
+  }
+}
